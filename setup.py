@@ -11,6 +11,7 @@ setup(
         "easyocr>=1.7.0",
         "numpy>=1.24.0",
         "Pillow>=10.0.0",
+        "openai>=1.0.0",
     ],
     entry_points={
         "console_scripts": [
