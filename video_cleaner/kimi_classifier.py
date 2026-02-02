@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
@@ -155,9 +156,20 @@ def _format_batch(indexed_boxes: list[_IndexedBox]) -> str:
 # ── API call with retry ──────────────────────────────────────────────
 
 
+def _make_client(config: KimiConfig):
+    """Create a reusable OpenAI client for the Kimi API session."""
+    from openai import OpenAI
+    return OpenAI(
+        api_key=config.api_key,
+        base_url=config.provider.base_url,
+        timeout=config.timeout_seconds,
+    )
+
+
 def _call_kimi_api(
     config: KimiConfig,
     user_content: str,
+    client=None,
 ) -> Optional[str]:
     """
     Make a single chat completion call to the Kimi K2.5 API.
@@ -165,20 +177,20 @@ def _call_kimi_api(
     Returns the assistant message content, or None on failure.
     Uses exponential backoff retry.
     """
-    try:
-        from openai import OpenAI
-    except ImportError:
-        logger.error(
-            "openai package is required for Kimi integration. "
-            "Install it with: pip install openai"
+    if client is None:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error(
+                "openai package is required for Kimi integration. "
+                "Install it with: pip install openai"
+            )
+            return None
+        client = OpenAI(
+            api_key=config.api_key,
+            base_url=config.provider.base_url,
+            timeout=config.timeout_seconds,
         )
-        return None
-
-    client = OpenAI(
-        api_key=config.api_key,
-        base_url=config.provider.base_url,
-        timeout=config.timeout_seconds,
-    )
 
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -229,6 +241,10 @@ def classify_with_kimi(
     """
     Send OCR results to Kimi K2.5 for semantic PII classification.
 
+    Optimizations:
+    1. Deduplication: identical text strings are sent once, verdict fanned out.
+    2. Parallel batching: batches processed concurrently (up to max_concurrent_calls).
+
     Args:
         config: Kimi API configuration.
         ocr_boxes: List of OCR boxes (from all sampled frames in this batch).
@@ -245,57 +261,125 @@ def classify_with_kimi(
     if not ocr_boxes:
         return {}
 
-    # Assign batch IDs and chunk into API calls
-    indexed = [_IndexedBox(batch_id=i, box=b) for i, b in enumerate(ocr_boxes)]
+    # ── Deduplication ────────────────────────────────────────────────
+    # Group boxes by text content. Send one representative per unique text.
+    text_to_indices: dict[str, list[int]] = {}
+    for i, box in enumerate(ocr_boxes):
+        text_to_indices.setdefault(box.text, []).append(i)
 
-    # Split into chunks respecting max_ocr_items_per_call
-    chunks = []
-    for i in range(0, len(indexed), config.max_ocr_items_per_call):
-        chunks.append(indexed[i:i + config.max_ocr_items_per_call])
+    # Build representative list (first occurrence of each unique text)
+    unique_texts: list[tuple[str, int]] = []  # (text, representative_index)
+    for text, indices in text_to_indices.items():
+        unique_texts.append((text, indices[0]))
 
-    results: dict[int, tuple[str, str]] = {}
+    logger.info(
+        "Kimi dedup: %d boxes -> %d unique texts (%.0f%% reduction)",
+        len(ocr_boxes), len(unique_texts),
+        (1 - len(unique_texts) / len(ocr_boxes)) * 100 if ocr_boxes else 0,
+    )
 
-    for chunk_idx, chunk in enumerate(chunks):
+    # Create _IndexedBox entries where batch_id = position in unique_texts
+    representatives = [
+        _IndexedBox(batch_id=uid, box=ocr_boxes[orig_idx])
+        for uid, (_text, orig_idx) in enumerate(unique_texts)
+    ]
+
+    # ── Chunk into batches ───────────────────────────────────────────
+    chunks: list[list[_IndexedBox]] = []
+    for i in range(0, len(representatives), config.max_ocr_items_per_call):
+        chunks.append(representatives[i:i + config.max_ocr_items_per_call])
+
+    logger.info(
+        "Kimi: %d batches of up to %d items, concurrency=%d",
+        len(chunks), config.max_ocr_items_per_call, config.max_concurrent_calls,
+    )
+
+    # ── Shared client ────────────────────────────────────────────────
+    try:
+        client = _make_client(config)
+    except Exception:
+        logger.error("Failed to create OpenAI client for Kimi")
+        return {}
+
+    # ── Batch processor ──────────────────────────────────────────────
+    unique_verdicts: dict[int, tuple[str, str]] = {}
+    total_chunks = len(chunks)
+
+    def _process_batch(chunk_idx: int, chunk: list[_IndexedBox]) -> dict[int, tuple[str, str]]:
         batch_json = _format_batch(chunk)
-        token_estimate = len(batch_json) // 3  # rough char-to-token ratio
+        token_estimate = len(batch_json) // 3
         logger.info(
             "Kimi batch %d/%d: %d items (~%d input tokens)",
-            chunk_idx + 1, len(chunks), len(chunk), token_estimate,
+            chunk_idx + 1, total_chunks, len(chunk), token_estimate,
         )
 
-        response_text = _call_kimi_api(config, batch_json)
+        response_text = _call_kimi_api(config, batch_json, client=client)
         if response_text is None:
             logger.warning(
                 "Kimi batch %d/%d failed, skipping %d items",
-                chunk_idx + 1, len(chunks), len(chunk),
+                chunk_idx + 1, total_chunks, len(chunk),
             )
-            continue
+            return {}
 
         verdicts = _parse_json_response(response_text)
         if verdicts is None:
             logger.warning(
                 "Kimi batch %d/%d returned unparseable response, skipping",
-                chunk_idx + 1, len(chunks),
+                chunk_idx + 1, total_chunks,
             )
-            continue
+            return {}
 
-        # Map verdicts back to input indices
+        batch_results: dict[int, tuple[str, str]] = {}
         valid_count = 0
         for item in verdicts:
             if not _validate_verdict(item):
                 continue
             batch_id = item["id"]
-            if not isinstance(batch_id, int) or batch_id < 0 or batch_id >= len(indexed):
+            if not isinstance(batch_id, int) or batch_id < 0 or batch_id >= len(representatives):
                 continue
             verdict = item["verdict"]
             category = item.get("category", "unknown")
-            results[batch_id] = (verdict, category)
+            batch_results[batch_id] = (verdict, category)
             valid_count += 1
 
         logger.info(
             "Kimi batch %d/%d: %d/%d valid verdicts (%d REDACT)",
-            chunk_idx + 1, len(chunks), valid_count, len(chunk),
-            sum(1 for v, _ in results.values() if v == "REDACT"),
+            chunk_idx + 1, total_chunks, valid_count, len(chunk),
+            sum(1 for v, _ in batch_results.values() if v == "REDACT"),
         )
+        return batch_results
+
+    # ── Execute batches ──────────────────────────────────────────────
+    max_workers = min(config.max_concurrent_calls, len(chunks))
+    if max_workers <= 1:
+        # Sequential fallback
+        for chunk_idx, chunk in enumerate(chunks):
+            unique_verdicts.update(_process_batch(chunk_idx, chunk))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_batch, idx, chunk): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                try:
+                    unique_verdicts.update(future.result())
+                except Exception as e:
+                    cidx = futures[future]
+                    logger.error("Kimi batch %d failed with exception: %s", cidx + 1, e)
+
+    # ── Fan out verdicts to all original indices ─────────────────────
+    results: dict[int, tuple[str, str]] = {}
+    for uid, (text, _repr_idx) in enumerate(unique_texts):
+        if uid in unique_verdicts:
+            verdict = unique_verdicts[uid]
+            for orig_idx in text_to_indices[text]:
+                results[orig_idx] = verdict
+
+    logger.info(
+        "Kimi total: %d unique verdicts fanned out to %d box verdicts (%d REDACT)",
+        len(unique_verdicts), len(results),
+        sum(1 for v, _ in results.values() if v == "REDACT"),
+    )
 
     return results

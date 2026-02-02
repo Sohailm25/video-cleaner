@@ -130,15 +130,43 @@ def run_pipeline(
     if kimi_config.enabled:
         logger.info("Running Kimi K2.5 semantic classifier...")
         t_kimi = time.time()
-        kimi_verdicts = classify_with_kimi(kimi_config, all_ocr_boxes_flat)
-        kimi_time = time.time() - t_kimi
 
+        # Only send boxes NOT already flagged by regex.
+        # Union merge means Kimi can only ADD redactions, so re-classifying
+        # regex-flagged boxes is pure waste.
+        regex_flagged_indices = {
+            i for i, cb in enumerate(regex_results) if cb.should_redact
+        }
+        kimi_input_boxes = [
+            box for i, box in enumerate(all_ocr_boxes_flat)
+            if i not in regex_flagged_indices
+        ]
+        logger.info(
+            "Kimi input: %d boxes (%d skipped, already flagged by regex)",
+            len(kimi_input_boxes), len(regex_flagged_indices),
+        )
+
+        kimi_verdicts_raw = classify_with_kimi(kimi_config, kimi_input_boxes)
+
+        # Remap verdicts back to original all_ocr_boxes_flat indices.
+        # kimi_verdicts_raw keys are indices into kimi_input_boxes;
+        # merge_classifications needs indices into all_ocr_boxes_flat.
+        non_flagged_indices = [
+            i for i in range(len(all_ocr_boxes_flat))
+            if i not in regex_flagged_indices
+        ]
+        kimi_verdicts = {
+            non_flagged_indices[k]: v
+            for k, v in kimi_verdicts_raw.items()
+        }
+
+        kimi_time = time.time() - t_kimi
         kimi_redact_count = sum(
             1 for v, _ in kimi_verdicts.values() if v == "REDACT"
         )
         logger.info(
             "Kimi classifier: %d/%d boxes analyzed, %d flagged for redaction (%.1fs)",
-            len(kimi_verdicts), len(all_ocr_boxes_flat),
+            len(kimi_verdicts), len(kimi_input_boxes),
             kimi_redact_count, kimi_time,
         )
 

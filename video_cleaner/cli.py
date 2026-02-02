@@ -127,6 +127,12 @@ def main():
         default=60.0,
         help="Timeout in seconds for each Kimi API call. Default: 60.",
     )
+    kimi_group.add_argument(
+        "--kimi-concurrency",
+        type=int,
+        default=4,
+        help="Max parallel Kimi API calls. Default: 4.",
+    )
 
     # ── Output options ──────────────────────────────────────────────
 
@@ -164,6 +170,7 @@ def main():
         provider=KimiProvider(args.kimi_provider),
         max_ocr_items_per_call=args.kimi_batch_size,
         timeout_seconds=args.kimi_timeout,
+        max_concurrent_calls=args.kimi_concurrency,
     )
     kimi_config.resolve()
 

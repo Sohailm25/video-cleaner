@@ -49,6 +49,7 @@ class KimiConfig:
     timeout_seconds: float = 60.0
     max_retries: int = 3
     retry_base_delay: float = 2.0  # exponential backoff base
+    max_concurrent_calls: int = 4  # max parallel Kimi API requests
 
     def resolve(self):
         """Resolve API key from environment if not explicitly set."""
