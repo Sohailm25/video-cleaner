@@ -25,6 +25,8 @@ from .classifier import classify_boxes, merge_classifications, ClassifiedBox
 from .kimi_classifier import classify_with_kimi
 from .tracker import BoxTracker
 from .redactor import VideoRedactor, RedactStyle
+from .vision_classifier import classify_frames_vision, vision_detections_to_classified_boxes
+from .vision_sampler import sample_frames_smart
 
 logger = logging.getLogger(__name__)
 
@@ -130,15 +132,43 @@ def run_pipeline(
     if kimi_config.enabled:
         logger.info("Running Kimi K2.5 semantic classifier...")
         t_kimi = time.time()
-        kimi_verdicts = classify_with_kimi(kimi_config, all_ocr_boxes_flat)
-        kimi_time = time.time() - t_kimi
 
+        # Only send boxes NOT already flagged by regex.
+        # Union merge means Kimi can only ADD redactions, so re-classifying
+        # regex-flagged boxes is pure waste.
+        regex_flagged_indices = {
+            i for i, cb in enumerate(regex_results) if cb.should_redact
+        }
+        kimi_input_boxes = [
+            box for i, box in enumerate(all_ocr_boxes_flat)
+            if i not in regex_flagged_indices
+        ]
+        logger.info(
+            "Kimi input: %d boxes (%d skipped, already flagged by regex)",
+            len(kimi_input_boxes), len(regex_flagged_indices),
+        )
+
+        kimi_verdicts_raw = classify_with_kimi(kimi_config, kimi_input_boxes)
+
+        # Remap verdicts back to original all_ocr_boxes_flat indices.
+        # kimi_verdicts_raw keys are indices into kimi_input_boxes;
+        # merge_classifications needs indices into all_ocr_boxes_flat.
+        non_flagged_indices = [
+            i for i in range(len(all_ocr_boxes_flat))
+            if i not in regex_flagged_indices
+        ]
+        kimi_verdicts = {
+            non_flagged_indices[k]: v
+            for k, v in kimi_verdicts_raw.items()
+        }
+
+        kimi_time = time.time() - t_kimi
         kimi_redact_count = sum(
             1 for v, _ in kimi_verdicts.values() if v == "REDACT"
         )
         logger.info(
             "Kimi classifier: %d/%d boxes analyzed, %d flagged for redaction (%.1fs)",
-            len(kimi_verdicts), len(all_ocr_boxes_flat),
+            len(kimi_verdicts), len(kimi_input_boxes),
             kimi_redact_count, kimi_time,
         )
 
@@ -255,6 +285,189 @@ def run_pipeline(
                 "tracked_regions": len(regions),
             },
             "detections": all_detections,
+            "regions": [
+                {
+                    "region_id": r.region_id,
+                    "category": r.category.value,
+                    "sample_text": r.sample_text,
+                    "x": r.x, "y": r.y, "w": r.w, "h": r.h,
+                    "first_frame": r.first_frame,
+                    "last_frame": r.last_frame,
+                    "hit_count": r.hit_count,
+                }
+                for r in regions
+            ],
+        }
+        Path(report_path).write_text(json.dumps(report, indent=2))
+        logger.info("Detection report written to %s", report_path)
+
+    return result_path
+
+
+def run_vision_pipeline(
+    input_path: str,
+    output_path: Optional[str] = None,
+    redact_style: str = "blur",
+    blur_strength: int = 51,
+    padding: int = 8,
+    iou_threshold: float = 0.3,
+    max_gap_frames: int = 30,
+    report_path: Optional[str] = None,
+    kimi_config: Optional[KimiConfig] = None,
+    jpeg_quality: int = 85,
+    vision_max_fps: float = 3.0,
+    vision_min_fps: float = 0.5,
+    vision_change_threshold: float = 0.02,
+) -> str:
+    """Run the vision-first pipeline using Kimi K2.5 multimodal.
+
+    Sends frame images directly to Kimi K2.5 for PII detection with
+    bounding boxes. Skips OCR and regex entirely.
+
+    Returns:
+        Path to the cleaned output video.
+    """
+    input_p = Path(input_path)
+    if not input_p.exists():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    if output_path is None:
+        output_path = str(input_p.with_name(f"{input_p.stem}_cleaned{input_p.suffix}"))
+
+    if kimi_config is None or not kimi_config.enabled:
+        raise ValueError("Vision mode requires Kimi K2.5 to be enabled (--kimi)")
+
+    # ── Step 1: Video metadata ──────────────────────────────────────
+
+    meta = get_video_meta(input_path)
+    logger.info(
+        "Vision pipeline: %dx%d, %.1f fps, %d frames (%.1fs)",
+        meta.width, meta.height, meta.fps, meta.total_frames, meta.duration_seconds,
+    )
+
+    # ── Step 2: Smart frame sampling ────────────────────────────────
+
+    t0 = time.time()
+    logger.info(
+        "Smart sampling (min_fps=%.1f, max_fps=%.1f, threshold=%.3f)...",
+        vision_min_fps, vision_max_fps, vision_change_threshold,
+    )
+
+    frames = list(sample_frames_smart(
+        input_path,
+        min_fps=vision_min_fps,
+        max_fps=vision_max_fps,
+        change_threshold=vision_change_threshold,
+    ))
+    sample_time = time.time() - t0
+    logger.info("Sampled %d frames in %.1fs", len(frames), sample_time)
+
+    # ── Step 3: Kimi K2.5 vision classification ─────────────────────
+
+    t_vision = time.time()
+    detections = classify_frames_vision(kimi_config, frames, jpeg_quality)
+    vision_time = time.time() - t_vision
+
+    logger.info("Vision classified %d detections in %.1fs", len(detections), vision_time)
+
+    # ── Step 4: Track regions across frames ─────────────────────────
+
+    classified_by_frame = vision_detections_to_classified_boxes(detections)
+
+    tracker = BoxTracker(
+        iou_threshold=iou_threshold,
+        max_gap_frames=max_gap_frames,
+        padding=padding,
+    )
+
+    all_detections_report: list[dict] = []
+
+    for frame_idx, timestamp, _frame_bgr in frames:
+        frame_boxes = classified_by_frame.get(frame_idx, [])
+        if frame_boxes:
+            tracker.update(frame_idx, frame_boxes)
+            for cb in frame_boxes:
+                all_detections_report.append({
+                    "frame_index": frame_idx,
+                    "timestamp": round(timestamp, 2),
+                    "text": cb.box.text,
+                    "category": cb.category.value,
+                    "pattern": "",
+                    "source": "kimi_vision",
+                    "box": cb.box.to_dict(),
+                })
+
+    regions = tracker.finalize()
+    logger.info("Tracked %d unique PII regions across video", len(regions))
+
+    if not regions:
+        logger.info("No PII detected. Copying input to output without changes.")
+        shutil.copy2(input_path, output_path)
+        return output_path
+
+    # Expand region frame ranges to cover gaps between samples
+    if len(frames) >= 2:
+        avg_interval = (frames[-1][0] - frames[0][0]) / (len(frames) - 1)
+        frame_interval = max(1, int(avg_interval))
+    else:
+        frame_interval = int(meta.fps)
+
+    for region in regions:
+        region.first_frame = max(0, region.first_frame - frame_interval)
+        region.last_frame = min(
+            meta.total_frames - 1,
+            region.last_frame + frame_interval,
+        )
+
+    # ── Step 5: Redact and re-encode ────────────────────────────────
+
+    style = RedactStyle.BLUR if redact_style == "blur" else RedactStyle.BOX
+    logger.info("Applying %s redaction to %d regions...", style.value, len(regions))
+
+    t1 = time.time()
+    redactor = VideoRedactor(
+        input_path=input_path,
+        output_path=output_path,
+        regions=regions,
+        style=style,
+        blur_strength=blur_strength,
+    )
+    result_path = redactor.run()
+    redact_time = time.time() - t1
+
+    logger.info("Redaction complete in %.1fs. Output: %s", redact_time, result_path)
+
+    # ── Report ──────────────────────────────────────────────────────
+
+    if report_path:
+        report = {
+            "input": input_path,
+            "output": output_path,
+            "video": {
+                "width": meta.width,
+                "height": meta.height,
+                "fps": meta.fps,
+                "total_frames": meta.total_frames,
+                "duration_seconds": round(meta.duration_seconds, 2),
+            },
+            "settings": {
+                "mode": "vision",
+                "redact_style": redact_style,
+                "jpeg_quality": jpeg_quality,
+                "vision_max_fps": vision_max_fps,
+                "vision_min_fps": vision_min_fps,
+                "vision_change_threshold": vision_change_threshold,
+                "kimi_provider": kimi_config.provider.value,
+            },
+            "stats": {
+                "frames_sampled": len(frames),
+                "sample_time_seconds": round(sample_time, 2),
+                "vision_time_seconds": round(vision_time, 2),
+                "redact_time_seconds": round(redact_time, 2),
+                "total_detections": len(all_detections_report),
+                "tracked_regions": len(regions),
+            },
+            "detections": all_detections_report,
             "regions": [
                 {
                     "region_id": r.region_id,

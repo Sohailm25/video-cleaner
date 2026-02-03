@@ -49,6 +49,7 @@ class KimiConfig:
     timeout_seconds: float = 60.0
     max_retries: int = 3
     retry_base_delay: float = 2.0  # exponential backoff base
+    max_concurrent_calls: int = 4  # max parallel Kimi API requests
 
     def resolve(self):
         """Resolve API key from environment if not explicitly set."""
@@ -102,6 +103,13 @@ class PipelineConfig:
 
     # Kimi K2.5 integration
     kimi: KimiConfig = field(default_factory=KimiConfig)
+
+    # Vision mode (Kimi K2.5 multimodal — sends frame images directly)
+    vision_mode: bool = False
+    vision_jpeg_quality: int = 85
+    vision_max_fps: float = 3.0
+    vision_min_fps: float = 0.5
+    vision_change_threshold: float = 0.02
 
     # Reporting
     report_path: Optional[str] = None

@@ -6,7 +6,7 @@ import sys
 
 from . import __version__
 from .config import KimiConfig, KimiProvider
-from .pipeline import run_pipeline
+from .pipeline import run_pipeline, run_vision_pipeline
 
 
 def main():
@@ -127,6 +127,49 @@ def main():
         default=60.0,
         help="Timeout in seconds for each Kimi API call. Default: 60.",
     )
+    kimi_group.add_argument(
+        "--kimi-concurrency",
+        type=int,
+        default=4,
+        help="Max parallel Kimi API calls. Default: 4.",
+    )
+
+    # ── Vision mode options ─────────────────────────────────────────
+
+    vision_group = parser.add_argument_group(
+        "Vision mode",
+        "Send frame images directly to Kimi K2.5 for PII detection. "
+        "Skips OCR and regex entirely — uses Kimi's native vision.",
+    )
+    vision_group.add_argument(
+        "--vision",
+        action="store_true",
+        help="Use Kimi K2.5 vision mode (sends frame images, skips OCR+regex).",
+    )
+    vision_group.add_argument(
+        "--vision-quality",
+        type=int,
+        default=85,
+        help="JPEG quality for frame encoding (1-100). Default: 85.",
+    )
+    vision_group.add_argument(
+        "--vision-max-fps",
+        type=float,
+        default=3.0,
+        help="Max frames/sec to analyze in vision mode. Default: 3.0.",
+    )
+    vision_group.add_argument(
+        "--vision-min-fps",
+        type=float,
+        default=0.5,
+        help="Min frames/sec (guarantees sampling even on static screens). Default: 0.5.",
+    )
+    vision_group.add_argument(
+        "--vision-change-threshold",
+        type=float,
+        default=0.02,
+        help="Content change sensitivity (lower = more sensitive). Default: 0.02.",
+    )
 
     # ── Output options ──────────────────────────────────────────────
 
@@ -157,6 +200,10 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # Vision mode implies --kimi
+    if args.vision:
+        args.kimi = True
+
     # Build Kimi config
     kimi_config = KimiConfig(
         enabled=args.kimi,
@@ -164,23 +211,40 @@ def main():
         provider=KimiProvider(args.kimi_provider),
         max_ocr_items_per_call=args.kimi_batch_size,
         timeout_seconds=args.kimi_timeout,
+        max_concurrent_calls=args.kimi_concurrency,
     )
     kimi_config.resolve()
 
     try:
-        output = run_pipeline(
-            input_path=args.input,
-            output_path=args.output,
-            sample_fps=args.sample_fps,
-            redact_style=args.style,
-            blur_strength=args.blur_strength,
-            min_ocr_confidence=args.min_confidence,
-            iou_threshold=args.iou_threshold,
-            padding=args.padding,
-            gpu=args.gpu,
-            report_path=args.report,
-            kimi_config=kimi_config,
-        )
+        if args.vision:
+            output = run_vision_pipeline(
+                input_path=args.input,
+                output_path=args.output,
+                redact_style=args.style,
+                blur_strength=args.blur_strength,
+                padding=args.padding,
+                iou_threshold=args.iou_threshold,
+                report_path=args.report,
+                kimi_config=kimi_config,
+                jpeg_quality=args.vision_quality,
+                vision_max_fps=args.vision_max_fps,
+                vision_min_fps=args.vision_min_fps,
+                vision_change_threshold=args.vision_change_threshold,
+            )
+        else:
+            output = run_pipeline(
+                input_path=args.input,
+                output_path=args.output,
+                sample_fps=args.sample_fps,
+                redact_style=args.style,
+                blur_strength=args.blur_strength,
+                min_ocr_confidence=args.min_confidence,
+                iou_threshold=args.iou_threshold,
+                padding=args.padding,
+                gpu=args.gpu,
+                report_path=args.report,
+                kimi_config=kimi_config,
+            )
         print(f"\nCleaned video saved to: {output}")
     except Exception as e:
         logging.getLogger(__name__).error("Pipeline failed: %s", e)
