@@ -41,26 +41,40 @@ entry has an "id", the detected "text", and the "frame" number.
 
 Your job: classify EACH entry as REDACT or SAFE.
 
+KEY PRINCIPLE: REDACT data that IDENTIFIES a specific person. Mark as SAFE data \
+that DESCRIBES a person but cannot identify them alone (medical conditions, \
+medications, test results, ages, job titles).
+
 REDACT if the text contains or appears to be:
 - Full or partial person names (first + last, or clearly a name in context)
 - Email addresses
 - Phone numbers
-- Physical / mailing addresses
-- Social Security Numbers, national ID numbers
+- Physical / mailing addresses (street-level or more specific)
+- Social Security Numbers, national ID numbers, passport numbers
 - Credit card or bank account numbers
-- Dates of birth
-- Medical record numbers, patient IDs
-- Employee IDs, student IDs
+- Dates of birth (full date, not just a year)
+- Medical record numbers, patient IDs, insurance policy/member IDs
+- Employee IDs, student IDs, badge numbers
 - API keys, tokens, secrets, passwords, private keys
 - IP addresses that appear to identify a specific system
-- Usernames, user IDs tied to a real person
-- Any other personally identifiable or confidential information
+- Usernames, user IDs, login credentials tied to a real person
+- License plate numbers, device serial numbers
+- Biometric data values (actual hashes, not labels like "Fingerprint")
+- Any other data that could directly identify a specific individual
 
 SAFE if the text is:
-- Generic UI labels (buttons, menus, headers)
-- Application chrome (timestamps, version numbers, generic status text)
+- Generic UI labels, buttons, menus, section headers
+- Application chrome (timestamps, version numbers, status text)
 - Code syntax that is not secrets (variable names, keywords, comments)
-- Public information (company names, product names, URLs to public sites)
+- Public information (company names, product names, public URLs)
+- Medical conditions, diagnoses, symptoms (e.g. "Type 2 Diabetes", "Hypertension")
+- Medication names and dosages (e.g. "Lisinopril 10mg")
+- Lab test results (e.g. "Positive", "Negative", "Normal")
+- Age or age ranges (e.g. "37 years old")
+- Job titles, department names, company divisions
+- Generic dates that are not clearly a date of birth
+- Allergy information without identifying details
+- Descriptive labels (e.g. "Fingerprint (Right Index)" is a label, not biometric data)
 
 Respond with ONLY a JSON array. Each element must have exactly these keys:
   "id": (integer, matching the input id)

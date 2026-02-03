@@ -27,6 +27,8 @@ class TrackedRegion:
     last_frame: int
     sample_text: str = ""
     hit_count: int = 1
+    # Per-frame positions for scroll tracking: frame_index -> (x, y, w, h)
+    frame_positions: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
 
     @property
     def x2(self) -> int:
@@ -35,6 +37,37 @@ class TrackedRegion:
     @property
     def y2(self) -> int:
         return self.y + self.h
+
+    def get_position_at_frame(self, frame_index: int) -> tuple[int, int, int, int]:
+        """Get interpolated (x, y, w, h) for a specific frame."""
+        if frame_index in self.frame_positions:
+            return self.frame_positions[frame_index]
+
+        frames = sorted(self.frame_positions.keys())
+        if not frames:
+            return (self.x, self.y, self.w, self.h)
+
+        if frame_index <= frames[0]:
+            return self.frame_positions[frames[0]]
+        if frame_index >= frames[-1]:
+            return self.frame_positions[frames[-1]]
+
+        # Linear interpolation between two nearest sampled frames
+        before = max(f for f in frames if f <= frame_index)
+        after = min(f for f in frames if f >= frame_index)
+
+        if before == after:
+            return self.frame_positions[before]
+
+        t = (frame_index - before) / (after - before)
+        bx, by, bw, bh = self.frame_positions[before]
+        ax, ay, aw, ah = self.frame_positions[after]
+        return (
+            int(bx + t * (ax - bx)),
+            int(by + t * (ay - by)),
+            int(bw + t * (aw - bw)),
+            int(bh + t * (ah - bh)),
+        )
 
 
 def _iou(a: OCRBox, b_region: TrackedRegion) -> float:
@@ -77,6 +110,7 @@ class BoxTracker:
         self._active: list[TrackedRegion] = []
         self._finalized: list[TrackedRegion] = []
         self._last_frame_seen: dict[int, int] = {}  # region_id -> last frame_index
+        self._text_index: dict[str, list[int]] = {}  # text -> list of region_ids
 
     def update(self, frame_index: int, classified_boxes: list[ClassifiedBox]):
         """
@@ -103,6 +137,23 @@ class BoxTracker:
                     best_iou = score
                     best_region = region
 
+            # Fallback: text-based matching for scrolled content
+            if (best_region is None or best_iou < self.iou_threshold) and box.text.strip():
+                text_key = box.text.strip()[:80]
+                for rid in self._text_index.get(text_key, []):
+                    candidate = next(
+                        (r for r in self._active if r.region_id == rid), None
+                    )
+                    if candidate is None:
+                        continue
+                    if candidate.category != cb.category:
+                        continue
+                    if candidate.region_id in matched_region_ids:
+                        continue
+                    best_region = candidate
+                    best_iou = self.iou_threshold  # treat as matched
+                    break
+
             if best_region is not None and best_iou >= self.iou_threshold:
                 # Update existing region: expand bbox to union
                 best_region.x = min(best_region.x, box.x)
@@ -111,23 +162,38 @@ class BoxTracker:
                 best_region.h = max(best_region.y2, box.y2) - best_region.y
                 best_region.last_frame = frame_index
                 best_region.hit_count += 1
+                best_region.frame_positions[frame_index] = (
+                    max(0, box.x - self.padding),
+                    max(0, box.y - self.padding),
+                    box.w + 2 * self.padding,
+                    box.h + 2 * self.padding,
+                )
                 self._last_frame_seen[best_region.region_id] = frame_index
                 matched_region_ids.add(best_region.region_id)
             else:
                 # Start a new tracked region
+                padded_x = max(0, box.x - self.padding)
+                padded_y = max(0, box.y - self.padding)
+                padded_w = box.w + 2 * self.padding
+                padded_h = box.h + 2 * self.padding
                 region = TrackedRegion(
                     region_id=self._next_id,
                     category=cb.category,
-                    x=max(0, box.x - self.padding),
-                    y=max(0, box.y - self.padding),
-                    w=box.w + 2 * self.padding,
-                    h=box.h + 2 * self.padding,
+                    x=padded_x,
+                    y=padded_y,
+                    w=padded_w,
+                    h=padded_h,
                     first_frame=frame_index,
                     last_frame=frame_index,
                     sample_text=box.text[:80],
+                    frame_positions={frame_index: (padded_x, padded_y, padded_w, padded_h)},
                 )
                 self._active.append(region)
                 self._last_frame_seen[region.region_id] = frame_index
+                # Index by text for scroll matching
+                text_key = box.text.strip()[:80]
+                if text_key:
+                    self._text_index.setdefault(text_key, []).append(region.region_id)
                 self._next_id += 1
 
         # Finalize regions that haven't appeared in max_gap_frames
